@@ -1,0 +1,11 @@
+{
+  "name": "smoke",
+  "version": 1,
+  "params": [
+    {"name": "Project", "required": true}
+  ],
+  "targets": [
+    {"name": "readme", "template": "templates/readme.tpl", "output_path": "README.md", "params": {"Project": "demo"}},
+    {"name": "main", "template": "templates/main.tpl", "output_path": "cmd/main.go", "depends_on": ["readme"], "params": {"Project": "demo"}}
+  ]
+}
