@@ -61,6 +61,40 @@ func loadManifest(dir, name string) (Manifest, error) {
 	return m, nil
 }
 
+// writeStateFile writes data to finalPath atomically: a temp file in the same
+// directory is fsynced and then renamed over the destination, so a crash can
+// leave only the old or the new bytes, never a half-written state file.
+func writeStateFile(finalPath string, data []byte) error {
+	dir := filepath.Dir(finalPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp := finalPath + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, finalPath); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 // saveManifest writes the manifest atomically: write a temp file in the same
 // directory, fsync it, then rename over the destination. A crash can leave
 // either the old file or the new one, never a half-written file.
@@ -73,27 +107,7 @@ func saveManifest(dir, name string, m Manifest) error {
 		return fmt.Errorf("encode manifest: %w", err)
 	}
 	final := filepath.Join(dir, name)
-	tmp := final + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return fmt.Errorf("create temp manifest: %w", err)
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("write temp manifest: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("sync temp manifest: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, final); err != nil {
-		os.Remove(tmp)
+	if err := writeStateFile(final, data); err != nil {
 		return fmt.Errorf("commit manifest: %w", err)
 	}
 	return nil

@@ -9,8 +9,16 @@
   摘要完全一致；
 - 对"用户改过的文件 / 已存在但不受管的文件 / 计划自身的更新"给出**可区分、
   可解释**的结论，绝不覆盖无关改动；
-- 有界并发调度，共享状态全部加锁；任一任务失败或运行被中断时执行
-  **全量回滚**（all-or-nothing），重试后恢复到可判定、可诊断的状态。
+- **只预演不落盘**：`preview` 给出与真实执行逐条一致的处理顺序和每目标结论，
+  全程不创建、不修改、不删除工作区里的任何文件；
+- **随时可查的状态**：`status` 能在上次正常结束、报错或被中途打断之后，报告
+  每个目标最后停在哪一步，并把"产物被使用者改过"与"产物已被删除"分开说明；
+- **多人/多流水线安全**：基于跨进程文件锁（flock），同一工作区上后到的运行
+  要么立刻得到明确的 `workspace_busy` 占用结论，要么用 `-wait-lock` 排队；
+- 有界并发调度，共享状态全部加锁；任一任务失败或运行被中断时，依据运行前
+  备份把**新建的文件删除、覆盖的文件还原**，使工作区字节级回到运行开始前；
+  进程被硬杀导致的残留，下次运行会先从备份恢复，再执行计划（all-or-nothing），
+  重试后恢复到可判定、可诊断的状态。
 
 无任何外部服务、真实凭据或网络依赖；仅使用 Go 标准库。
 
@@ -18,8 +26,9 @@
 
 ```
 internal/plan/     计划类型、静态校验、确定性拓扑排序
-internal/engine/   渲染、状态清单、并发调度器、提交/回滚、分类错误
-cmd/scaffold/      本地验证 CLI（validate / run / plan-example）
+internal/engine/   渲染、状态清单、并发调度器、预演、状态查询、
+                   跨进程锁、运行前备份/恢复、提交/回滚、分类错误
+cmd/scaffold/      本地验证 CLI（validate / preview / status / run / plan-example）
 ```
 
 ## 计划格式
@@ -114,18 +123,103 @@ cmd/scaffold/      本地验证 CLI（validate / run / plan-example）
 清单合并规则：成功提交时，本次计划涉及的目标条目整体替换（目标改了输出
 路径时旧路径条目被移除），属于其他目标/计划的条目原样保留。
 
-## 失败恢复规则
+## 预演（dry run）
 
-- 运行内创建的文件记录在回滚集合中（仅本次 **新建** 的文件；`recreated`
-  覆盖的是受管文件，其原始内容可由旧清单追溯）。
+```bash
+scaffold preview -f plan.json -root ./out
+```
+
+预演先做静态校验，再按真实执行的拓扑顺序渲染每个目标，对每个路径调用与
+`run` **完全相同**的判定逻辑（同一份 `decide` 函数），给出逐条结论。
+
+- 预演**完全不写盘**：不创建输出文件，也不创建 `.scaffold/`（甚至不会创建
+  锁文件）；在一个从没跑过的空目录上执行预演后，目录仍然为空。
+- 输出同样包含 `order`（处理顺序）和每个目标的 `status`、`sha256`、`reason`。
+- 结论词汇与真实执行一致：`created` / `verified` / `recreated` / `modified` /
+  `preexisting`；上游会失败时，下游同样记为 `skipped`，失败目标记为
+  `failed`。含义同[状态清单与冲突判定](#状态清单与冲突判定幂等模型)一节。
+- **语义边界**：预演描述的是"以当前磁盘和清单为起点、立即执行一次"的结果。
+  预演与真实执行之间如果有人改了文件、删了文件，或提交了别的清单，结论自然
+  会变；在没有这种介入的前提下，`preview` 与紧接着的 `run` 对每个目标给出的
+  `status`、顺序和摘要逐条相同（单测 `TestPreview_ConclusionsMatchRealRun`
+  覆盖了新建、原样复用、计划更新重写、人为改动、不受管文件，以及失败/跳过
+  传播这几种情形）。
+- 预演本身是只读的，因此不参与互斥排队；但如果此刻正有一次独占 `run` 在写
+  工作区，预演会以 `workspace_busy` 拒绝，避免读到写入中途的状态而给出
+  误导性结论。预演中若存在会失败的目标，会像真实执行一样返回
+  `render_error` 分类错误（但仍然什么都不写）。
+
+## 状态查询
+
+```bash
+# 只对照上次运行与磁盘
+scaffold status -root ./out
+# 额外对照"当前计划"，判断磁盘是否还跟计划一致
+scaffold status -root ./out -f plan.json
+```
+
+`status` 只读、不改任何东西，即使上次运行异常结束也能查。报告包含：
+
+- `phase`：上一次运行停在哪个阶段——`succeeded` / `failed` / `interrupted` /
+  `running` / `rolling_back`。后两者表示进程在运行中或回滚中被硬杀
+  （`stale=true`）。
+- 每个目标的 `lastRun`（上次记录的结论）与 `step`（最后到达的细粒度步骤：
+  `pending → rendering → rendered → decided → written → terminal`），以及当前
+  磁盘状况 `disk`。
+- `consistent`：磁盘是否与上次提交的清单一致；`matchesPlan`：在此之上磁盘
+  是否还等于当前计划渲染出来的内容。
+
+`disk` 把两类"使用者动过"的情况明确分开：
+
+| disk | 含义 |
+| --- | --- |
+| `in_sync` | 磁盘与上次提交一致，且与当前计划渲染一致。 |
+| `plan_changed` | 磁盘与上次提交一致，但当前计划会渲染出不同内容（再跑会 `recreated`）。 |
+| `user_modified` | 磁盘内容与上次提交的记录不一致——**产物被使用者改过**。 |
+| `deleted` | 上次提交过的产物**已经从磁盘上被删除**。 |
+| `planned_absent` | 路径在当前计划里、磁盘上不存在、也从未生成过。 |
+| `unexpected` | 路径上有文件，但清单里没有归当前目标所有的记录（不受管/属主不符）。 |
+
+## 多人共用与并发占用
+
+- 每次 `run` 开始时先在 `.scaffold/lock` 上获取一个**跨进程**的排他文件锁
+  （POSIX `flock`）。同一工作区上，无论来自多个 Engine 实例、多个进程还是
+  多条 CI 流水线，同时只有一次运行能写盘。
+- 后到的运行默认**不等待**，立即以 `workspace_busy`（CLI 退出码 7）失败，
+  错误信息里给出持有者的模式、计划名、PID/主机和开始时间，便于判断是谁占用。
+- 加 `-wait-lock` 后，后到的运行在锁上排队，前一个结束后按序执行；等待过程
+  响应上下文取消。
+- `preview` 遇到占用立即返回 `workspace_busy`；`status` 始终只读可用。
+- 锁随文件描述符由内核持有，持锁进程退出（正常或崩溃）即自动释放，不会出现
+  永久死锁；持锁者信息记录在独立的 `.scaffold/lockholder.json` 中。
+
+## 失败与中断后的恢复保证
+
+- **运行前备份**：每次运行在 `.scaffold/backup/<run-id>/` 建一个运行级备份。
+  任何计划路径在**第一次被写之前**，其当时的字节（或"当时不存在"这一事实）
+  都被记录一次；并发 worker 因此不可能备份到写了一半的文件。
 - 任意 `failed`、`skipped`（上游失败）或 `context` 中断：
   1. 停止派发新任务，等待已在执行的任务到达终态；
-  2. 删除回滚集合中的全部文件，使磁盘恢复到运行前状态；
-  3. **不更新清单**（旧清单原封不动，清单写入本身是原子的）；
-  4. 返回带分类的错误和尽力而为的报告（每个目标的 status、reason、摘要、
-     attempt 次数都可诊断）。
+  2. 状态文件先记为 `rolling_back`；
+  3. 依据备份还原：本次**新建**的文件删除（并清理遗留空目录），本次**覆盖**
+     的文件用运行前的字节还原——磁盘回到运行开始前，不会留下半新半旧的
+     产物；
+  4. **不更新清单**（旧清单原封不动，清单写入本身是原子的）；
+  5. 状态文件记为 `failed`/`interrupted` 并删除本次备份；
+  6. 返回带分类的错误和报告（每个目标的 status、reason、摘要、attempt、
+     最后步骤都可诊断）。
+- **进程被硬杀（SIGKILL/断电）**：锁由内核自动释放；下次 `run` 获取锁后先做
+  恢复检查——若状态文件停在 `running`/`rolling_back` 且留有备份目录，就先从
+  最早的备份把工作区还原，再执行计划，并在报告的 `recovered` 中记录恢复了
+  哪个残留运行。
+- 若还原本身遇到 IO 错误，备份会被保留、状态停在 `rolling_back`，错误信息
+  逐条列出需要人工处理的路径，而不是静默丢掉——不会出现磁盘、状态、计划
+  三边对不上却无法判断的情况。
+- 清单提交失败（写盘后）同样按备份还原，保证"产物已改但清单没更新"这种
+  中间态不会外泄。
 - 修正计划（或恢复上下文）后重试：因为磁盘与清单已回到一致的前态，重试
-  会像第一次运行一样得到确定的 `created`/`verified` 结论。
+  会收敛到一个确定结果——要么成功（`created`/`verified`/…），要么明确指出
+  需要人工处理的路径。
 - 同一 `Engine` 实例维护内存中的 `attempt` 计数：目标**真正被处理**一次
   （包括处理后失败）计数 +1；仅被 `skipped` 不计。新进程/新 Engine 从 1
   开始。
@@ -135,40 +229,52 @@ cmd/scaffold/      本地验证 CLI（validate / run / plan-example）
 | kind | 含义 | 退出码 |
 | --- | --- | --- |
 | `invalid_plan` | 静态校验拒绝，未触碰文件。 | 2 |
-| `render_error` | 模板解析/执行失败。 | 3 |
+| `render_error` | 模板解析/执行失败（含预演中发现的必然失败）。 | 3 |
 | `write_error` / `manifest_error` | 文件 IO 或清单提交失败。 | 4 |
 | `interrupted` | 上下文取消 / 收到中断信号。 | 5 |
 | `partial_failure` | 存在失败/跳过的兜底分类。 | 6 |
+| `workspace_busy` | 另一次运行正独占该工作区；本次未启动。 | 7 |
 
 ## 并发安全
 
-- 一个 `Engine` 上的 `Run` 整体互斥（同一根目录的并发运行被串行化，先到者
-  创建、其余验证，结果仍确定）。
-- 单次运行内：调度共享状态由单一互斥量 + 条件变量保护；文件系统决策由
-  运行级锁串行化；attempt 计数有独立互斥量。`go test -race` 干净。
+- 跨工作区：POSIX `flock` 排他锁串行化不同进程/Engine/CI 任务对同一根目录的
+  写操作；默认快速失败，`-wait-lock` 时排队。
+- 同一 `Engine` 实例上的 `Run` 仍由实例级互斥量串行化。
+- 单次运行内：调度共享状态由单一互斥量 + 条件变量保护；文件系统判定与备份
+  由运行级锁串行化；状态文件的每次更新都是"临时文件 + fsync + rename"的
+  原子写；attempt 计数有独立互斥量。`go test -race` 干净。
 
 ## 本地验证方法
 
 全部离线完成，不需要网络：
 
 ```bash
-# 单元测试（plan + engine，覆盖循环依赖/并发/部分失败恢复/中断回滚）
+# 单元测试（plan + engine，覆盖循环依赖/并发/预演一致性/部分失败恢复/
+# 中断还原/删除与改动区分/重跑收敛/跨进程占用/硬杀恢复）
 go test ./...
 
 # 竞态检测 + 重复运行
 go test -race -count=5 ./...
 
-# 静态检查与构建
+# 静态检查与构建（含 Windows 交叉编译）
 go vet ./...
 go build ./...
+GOOS=windows GOARCH=amd64 go build ./...
 
 # CLI 端到端
 go run ./cmd/scaffold plan-example -o /tmp/plan.json
 go run ./cmd/scaffold validate -f /tmp/plan.json
+go run ./cmd/scaffold preview -f /tmp/plan.json -root /tmp/out   # 空目录：全部 created，不落盘
 go run ./cmd/scaffold run -f /tmp/plan.json -root /tmp/out -workers 4
-go run ./cmd/scaffold run -f /tmp/plan.json -root /tmp/out   # 再跑一次：全部 verified
+go run ./cmd/scaffold preview -f /tmp/plan.json -root /tmp/out   # 再预演：全部 verified
+go run ./cmd/scaffold run -f /tmp/plan.json -root /tmp/out       # 再跑：全部 verified
+go run ./cmd/scaffold status -f /tmp/plan.json -root /tmp/out    # phase/step/disk 一致性
+# 第二个终端同时发起，立即得到占用结论（退出码 7）；加 -wait-lock 则排队：
+go run ./cmd/scaffold run -f /tmp/plan.json -root /tmp/out -wait-lock
 ```
 
 单测日志（`go test -v`）会打印每个场景的**输入计划**（`INPUT PLAN`）、
 **处理顺序**与**最终状态**（`PROCESSING ORDER + FINAL STATE`，含每个目标的
-status、SHA-256、reason、attempt）。
+status、SHA-256、reason、attempt）；预演用例额外打印
+`PREVIEW PROCESSING ORDER + FINAL STATE`，状态用例打印每个目标的
+lastRun/step/disk。

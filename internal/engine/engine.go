@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/xingjianluo/scaffold-codegen-engine-go/internal/plan"
 )
@@ -56,12 +57,13 @@ type Result struct {
 
 // Report is the full, deterministic outcome of one run.
 type Report struct {
-	PlanName string         `json:"planName,omitempty"`
-	Success  bool           `json:"success"`
-	Order    []string       `json:"order"`
-	Results  []Result       `json:"results"`
-	Manifest Manifest       `json:"manifest"`
-	Error    *ClassifiedErr `json:"error,omitempty"`
+	PlanName  string         `json:"planName,omitempty"`
+	Success   bool           `json:"success"`
+	Order     []string       `json:"order"`
+	Results   []Result       `json:"results"`
+	Manifest  Manifest       `json:"manifest"`
+	Recovered []string       `json:"recovered,omitempty"` // backups restored at start (interrupted earlier run)
+	Error     *ClassifiedErr `json:"error,omitempty"`
 }
 
 // Error categories returned by Run.
@@ -103,6 +105,9 @@ type Options struct {
 	Workers int
 	// ManifestName is the manifest file name under .scaffold/.
 	ManifestName string
+	// WaitLock makes Run queue behind another run holding the workspace lock
+	// instead of failing immediately with workspace_busy.
+	WaitLock bool
 }
 
 // Engine runs plans against a root directory.
@@ -126,10 +131,24 @@ func New(root string, opts Options) *Engine {
 	return &Engine{root: root, options: opts, attempt: map[string]int{}}
 }
 
-// Run validates and executes the plan. On failure or ctx cancellation it
-// rolls back every file created during this run and leaves the previous
-// manifest untouched, then returns a classified error and a best-effort
-// report. A successful run always commits the new manifest atomically.
+// Run validates and executes the plan.
+//
+// Coordination and durability:
+//   - A cross-process exclusive flock on .scaffold/lock serializes runs from
+//     multiple engines/processes/CI jobs on the same workspace. A second run
+//     either fails immediately with workspace_busy (default) or queues behind
+//     the holder (Options.WaitLock).
+//   - Before any plan file is (re)written its pre-run bytes are captured once
+//     in a run-local backup directory. On failure or interruption the backup
+//     restores the workspace byte-for-byte to its pre-run state (created files
+//     are deleted, overwritten files restored), so a retry starts from a
+//     consistent state.
+//   - state.json records every target's step and the run phase, surviving
+//     normal completion, errors and hard interruption for later Status
+//     queries.
+//
+// A successful run commits the new manifest atomically, then the state record,
+// and removes the backup; a failed run never commits the manifest.
 func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -154,18 +173,65 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 		return report, report.Error
 	}
 
-	manifestDir := filepath.Join(e.root, ManifestDir)
-	manifest, err := loadManifest(manifestDir, e.options.ManifestName)
+	stateDir := filepath.Join(e.root, ManifestDir)
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		report.Error = &ClassifiedErr{Kind: KindWrite, Message: err.Error()}
+		return report, report.Error
+	}
+
+	// Exclusive cross-process lock before touching anything.
+	holder := lockHolder{
+		Mode:      "run",
+		PlanName:  p.NameSafe(),
+		PID:       os.Getpid(),
+		Host:      hostName(),
+		StartedAt: nowUTC().Format(time.RFC3339Nano),
+	}
+	lock, err := acquireWorkspaceLock(ctx, e.root, true, e.options.WaitLock, holder)
+	if err != nil {
+		if cerr, ok := err.(*ClassifiedErr); ok {
+			report.Error = cerr
+			return report, cerr
+		}
+		report.Error = &ClassifiedErr{Kind: KindWrite, Message: err.Error()}
+		return report, report.Error
+	}
+	defer lock.release()
+
+	// Recover from a previous process that died mid-run or mid-restore: if
+	// the last state is non-terminal and a backup survives, restore it before
+	// doing anything else. Committed-state backups are just garbage-collected.
+	if err := e.recoverStale(stateDir, report); err != nil {
+		report.Error = &ClassifiedErr{Kind: KindWrite, Message: err.Error()}
+		return report, report.Error
+	}
+
+	manifest, err := loadManifest(stateDir, e.options.ManifestName)
 	if err != nil {
 		report.Error = &ClassifiedErr{Kind: KindManifest, Message: err.Error()}
 		return report, report.Error
 	}
 
+	// This run's pre-write backup.
+	runID := newRunID()
+	bk, err := newBackup(e.root, runID)
+	if err != nil {
+		report.Error = &ClassifiedErr{Kind: KindWrite, Message: err.Error()}
+		return report, report.Error
+	}
+
+	state := newRunState(p, order, holder)
+	if err := state.save(stateDir, StateFileName); err != nil {
+		report.Error = &ClassifiedErr{Kind: KindManifest, Message: err.Error()}
+		_ = bk.remove()
+		return report, report.Error
+	}
+	recorder := newStateRecorder(stateDir, StateFileName, state)
+
 	// Run-local state shared by workers.
 	var stateMu sync.Mutex
 	rendered := make(map[string]string, len(order)) // target ID -> body
 	staged := Manifest{Version: manifestVersion, Entries: map[string]FileEntry{}}
-	var createdPaths []string // paths created this run (rollback set)
 	var interrupted bool
 	var firstErr *ClassifiedErr
 
@@ -183,11 +249,14 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 		// An attempt starts as soon as the target is actually processed, so
 		// the counter survives in the Engine even when a run rolls back.
 		attempt := e.bumpAttempt(t.ID)
+		_ = recorder.record(t, TargetState{Step: StepRendering, Attempt: attempt})
 		if err := ctx.Err(); err != nil {
 			markFailure(KindInterrupted, "run interrupted before processing target "+t.ID+": "+err.Error())
 			stateMu.Lock()
 			interrupted = true
 			stateMu.Unlock()
+			_ = recorder.record(t, TargetState{Step: StepTerminal, Status: StatusFailed,
+				Reason: "interrupted: " + err.Error(), Attempt: attempt})
 			return outcome{status: StatusFailed, reason: "interrupted: " + err.Error(), attempt: attempt}
 		}
 
@@ -202,32 +271,49 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 		body, rerr := render(t, p, deps)
 		if rerr != nil {
 			markFailure(KindRender, rerr.Error())
+			_ = recorder.record(t, TargetState{Step: StepTerminal, Status: StatusFailed,
+				Reason: rerr.Error(), Attempt: attempt})
 			return outcome{status: StatusFailed, reason: rerr.Error(), attempt: attempt}
 		}
 		sum := digest(body)
+		_ = recorder.record(t, TargetState{Step: StepRendered, Status: "",
+			SHA256: sum, Attempt: attempt})
 
 		// File-system decision is serialized so concurrent workers can never
-		// race on the same path (paths are plan-unique, but directory creation
-		// and preexistence checks still need a consistent view).
+		// race on the same path.
 		stateMu.Lock()
 		defer stateMu.Unlock()
 
 		status, reason, apply, werr := e.decide(t, body, sum, manifest, staged)
 		if werr != nil {
 			markFailure(KindWrite, werr.Error())
+			_ = recorder.record(t, TargetState{Step: StepTerminal, Status: StatusFailed,
+				Reason: werr.Error(), Attempt: attempt, SHA256: sum})
 			return outcome{status: StatusFailed, reason: werr.Error(), attempt: attempt, sha: sum}
 		}
+		_ = recorder.record(t, TargetState{Step: StepDecided, Status: status,
+			Reason: reason, Attempt: attempt, SHA256: sum})
 		if apply {
-			if err := e.writeFile(t.Path, body); err != nil {
+			// Capture pre-run bytes before the first write to this path.
+			if err := bk.captureIfNeeded(t.Path); err != nil {
 				markFailure(KindWrite, err.Error())
+				_ = recorder.record(t, TargetState{Step: StepTerminal, Status: StatusFailed,
+					Reason: err.Error(), Attempt: attempt, SHA256: sum})
 				return outcome{status: StatusFailed, reason: err.Error(), attempt: attempt, sha: sum}
 			}
-			if status == StatusCreated {
-				createdPaths = append(createdPaths, t.Path)
+			if err := e.writeFile(t.Path, body); err != nil {
+				markFailure(KindWrite, err.Error())
+				_ = recorder.record(t, TargetState{Step: StepTerminal, Status: StatusFailed,
+					Reason: err.Error(), Attempt: attempt, SHA256: sum})
+				return outcome{status: StatusFailed, reason: err.Error(), attempt: attempt, sha: sum}
 			}
+			_ = recorder.record(t, TargetState{Step: StepWritten, Status: status,
+				Reason: reason, Attempt: attempt, SHA256: sum})
 		}
 		rendered[t.ID] = body
 		staged.Entries[t.Path] = FileEntry{Target: t.ID, Path: t.Path, SHA256: sum, Content: body}
+		_ = recorder.record(t, TargetState{Step: StepTerminal, Status: status,
+			Reason: reason, Attempt: attempt, SHA256: sum})
 		return outcome{status: status, reason: reason, attempt: attempt, sha: sum}
 	})
 
@@ -257,32 +343,41 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 	report.Results = results
 
 	if failed || interrupted || firstErr != nil {
-		// All-or-nothing: remove exactly the files this run created and leave
-		// everything else byte-for-byte untouched. Best-effort cleanup; every
-		// removal error is reported so the state stays diagnosable.
-		var cleanupMsgs []string
-		stateMu.Lock()
-		toRemove := append([]string(nil), createdPaths...)
-		stateMu.Unlock()
-		for _, rel := range toRemove {
-			if rmErr := os.Remove(filepath.Join(e.root, rel)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-				cleanupMsgs = append(cleanupMsgs, rmErr.Error())
-			}
-		}
+		// Restore the workspace to exactly its pre-run state from the backup,
+		// so no half-new / half-old files remain.
+		_ = recorder.finish(PhaseRollingBack, firstErr, results)
+		cleanupMsgs := bk.restore()
+
 		kind := KindPartial
-		msg := "one or more targets failed; created files were rolled back and the manifest was not updated"
+		msg := "one or more targets failed; the workspace was restored to its pre-run state and the manifest was not updated"
 		if interrupted {
 			kind = KindInterrupted
-			msg = "run was interrupted; created files were rolled back and the manifest was not updated"
+			msg = "run was interrupted; the workspace was restored to its pre-run state and the manifest was not updated"
 		}
 		if firstErr != nil && firstErr.Kind == KindRender {
 			kind = KindRender
 		}
 		if len(cleanupMsgs) > 0 {
-			msg += "; cleanup errors: " + strings.Join(cleanupMsgs, "; ")
+			for _, e := range cleanupMsgs {
+				msg += "; restore error: " + e.Error()
+			}
 		}
-		report.Error = &ClassifiedErr{Kind: kind, Message: msg, Results: results}
-		return report, report.Error
+		finalErr := &ClassifiedErr{Kind: kind, Message: msg, Results: results}
+		// state.json stays describing the failed run and its terminal phase;
+		// the backup is intentionally kept when restore reported errors so a
+		// later run (or operator) can retry recovery.
+		if len(cleanupMsgs) == 0 {
+			phase := PhaseFailed
+			if interrupted {
+				phase = PhaseInterrupted
+			}
+			_ = recorder.finish(phase, finalErr, results)
+			_ = bk.remove()
+		} else {
+			_ = recorder.finish(PhaseRollingBack, finalErr, results)
+		}
+		report.Error = finalErr
+		return report, finalErr
 	}
 
 	// Success: merge the new entries over the old manifest. Entries for
@@ -303,13 +398,77 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 	for path, entry := range staged.Entries {
 		merged.Entries[path] = entry
 	}
-	if err := saveManifest(manifestDir, e.options.ManifestName, merged); err != nil {
-		report.Error = &ClassifiedErr{Kind: KindManifest, Message: "commit failed after writing files: " + err.Error() + "; files are left on disk and match the rendered content", Results: results}
-		return report, report.Error
+	if err := saveManifest(stateDir, e.options.ManifestName, merged); err != nil {
+		cerr := &ClassifiedErr{Kind: KindManifest,
+			Message: "commit failed after writing files: " + err.Error() + "; restoring the workspace from backup",
+			Results: results}
+		_ = recorder.finish(PhaseRollingBack, cerr, results)
+		if rErrs := bk.restore(); len(rErrs) > 0 {
+			for _, re := range rErrs {
+				cerr.Message += "; restore error: " + re.Error()
+			}
+			_ = recorder.finish(PhaseRollingBack, cerr, results)
+		} else {
+			_ = recorder.finish(PhaseFailed, cerr, results)
+			_ = bk.remove()
+		}
+		report.Error = cerr
+		return report, cerr
 	}
+	// Manifest durable: success is committed. Record terminal state, then
+	// drop the now-redundant backup.
+	_ = recorder.finish(PhaseSucceeded, nil, results)
+	_ = bk.remove()
 	report.Success = true
 	report.Manifest = merged
 	return report, nil
+}
+
+// recoverStale handles leftovers from a process that died during a run. A
+// non-terminal state together with a surviving backup means the workspace may
+// contain partial writes: the oldest backup is restored. Backups whose run is
+// known terminal (or which are superseded) are removed.
+func (e *Engine) recoverStale(stateDir string, report *Report) error {
+	stale, err := listStaleBackups(e.root)
+	if err != nil {
+		return fmt.Errorf("inspect run backups: %w", err)
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+	state, _ := loadRunState(stateDir, StateFileName)
+	nonTerminal := state == nil || state.Phase == PhaseRunning || state.Phase == PhaseRollingBack
+	if nonTerminal {
+		// Restore from the oldest backup (the earliest unfinished run).
+		b := backupFromDir(e.root, stale[0])
+		if rErrs := b.restore(); len(rErrs) > 0 {
+			var msgs []string
+			for _, re := range rErrs {
+				msgs = append(msgs, re.Error())
+			}
+			return fmt.Errorf("recover workspace from interrupted run %q: %s", filepath.Base(stale[0]),
+				strings.Join(msgs, "; "))
+		}
+		report.Recovered = append(report.Recovered, filepath.Base(stale[0]))
+	}
+	for _, dir := range stale {
+		_ = os.RemoveAll(dir)
+	}
+	return nil
+}
+
+// hostName returns the machine hostname best-effort for lock metadata.
+func hostName() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return h
+}
+
+// newRunID returns a unique, sortable identifier for one run's backup dir.
+func newRunID() string {
+	return fmt.Sprintf("run-%d-%d", os.Getpid(), runCounter())
 }
 
 // decide classifies the action for a target without writing anything. apply

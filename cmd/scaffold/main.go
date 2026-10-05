@@ -6,11 +6,13 @@
 //
 //	scaffold plan-example [-o plan.json]
 //	scaffold validate -f plan.json
-//	scaffold run -f plan.json -root ./out [-workers 4]
+//	scaffold preview -f plan.json -root ./root
+//	scaffold status  -f plan.json -root ./root   (plan optional)
+//	scaffold run -f plan.json -root ./out [-workers 4] [-wait-lock]
 //
-// On success exit code is 0; validation, render, write and interruption
-// failures use distinct non-zero exit codes and the full report (processing
-// order, per-target status and digests) is printed as JSON.
+// On success exit code is 0; validation, render, write, interruption and
+// workspace-busy failures use distinct non-zero exit codes and the full report
+// (processing order, per-target status and digests) is printed as JSON.
 package main
 
 import (
@@ -52,6 +54,8 @@ func exitForKind(kind string) int {
 		return 5
 	case engine.KindPartial:
 		return 6
+	case engine.KindWorkspaceBusy:
+		return 7
 	default:
 		return 10
 	}
@@ -67,6 +71,10 @@ func run(args []string) error {
 		return cmdPlanExample(args[1:])
 	case "validate":
 		return cmdValidate(args[1:])
+	case "preview":
+		return cmdPreview(args[1:])
+	case "status":
+		return cmdStatus(args[1:])
 	case "run":
 		return cmdRun(args[1:])
 	case "-h", "--help", "help":
@@ -84,10 +92,14 @@ func usage() {
 Commands:
   plan-example [-o path]   write an example plan JSON to path (default stdout)
   validate   -f plan.json  validate a plan and print classified issues
-  run        -f plan.json -root DIR [-workers N]  execute a plan
+  preview    -f plan.json -root DIR  show processing order and per-target
+             conclusions without touching the workspace (read-only)
+  status     -root DIR [-f plan.json]  report last run phase/step per target
+             and whether disk, manifest and current plan still agree
+  run        -f plan.json -root DIR [-workers N] [-wait-lock]  execute a plan
 
 Exit codes: 0 ok, 2 invalid plan, 3 render error, 4 write/manifest error,
-5 interrupted, 6 partial failure, 10 other error.
+5 interrupted, 6 partial failure, 7 workspace busy, 10 other error.
 `)
 }
 
@@ -131,11 +143,52 @@ func cmdValidate(args []string) error {
 	return enc.Encode(map[string]any{"valid": true})
 }
 
+func cmdPreview(args []string) error {
+	fs := flag.NewFlagSet("preview", flag.ContinueOnError)
+	file := fs.String("f", "plan.json", "plan file")
+	root := fs.String("root", "out", "output root directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	p, err := loadPlan(*file)
+	if err != nil {
+		return err
+	}
+	preview, err := engine.New(*root, engine.Options{}).Preview(context.Background(), p)
+	if preview != nil {
+		_ = writeReport(os.Stdout, preview)
+	}
+	return err
+}
+
+func cmdStatus(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	file := fs.String("f", "", "plan file (optional; compares the disk to the current plan)")
+	root := fs.String("root", "out", "output root directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	var p *plan.Plan
+	if *file != "" {
+		loaded, err := loadPlan(*file)
+		if err != nil {
+			return err
+		}
+		p = loaded
+	}
+	report, err := engine.New(*root, engine.Options{}).Status(context.Background(), p)
+	if report != nil {
+		_ = writeReport(os.Stdout, report)
+	}
+	return err
+}
+
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	file := fs.String("f", "plan.json", "plan file")
 	root := fs.String("root", "out", "output root directory")
 	workers := fs.Int("workers", 4, "max parallel workers")
+	waitLock := fs.Bool("wait-lock", false, "queue behind another run instead of failing with workspace_busy")
 	quiet := fs.Bool("quiet", false, "suppress the JSON report")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -148,7 +201,7 @@ func cmdRun(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	e := engine.New(*root, engine.Options{Workers: *workers})
+	e := engine.New(*root, engine.Options{Workers: *workers, WaitLock: *waitLock})
 	report, err := e.Run(ctx, p)
 	if report != nil && !*quiet {
 		_ = writeReport(os.Stdout, report)
@@ -156,10 +209,10 @@ func cmdRun(args []string) error {
 	return err
 }
 
-func writeReport(w io.Writer, r *engine.Report) error {
+func writeReport(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(r)
+	return enc.Encode(v)
 }
 
 func loadPlan(path string) (*plan.Plan, error) {
