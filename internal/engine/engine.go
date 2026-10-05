@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/xingjianluo/scaffold-codegen-engine-go/internal/plan"
 )
@@ -58,6 +60,7 @@ type Result struct {
 type Report struct {
 	PlanName string         `json:"planName,omitempty"`
 	Success  bool           `json:"success"`
+	DryRun   bool           `json:"dryRun,omitempty"`
 	Order    []string       `json:"order"`
 	Results  []Result       `json:"results"`
 	Manifest Manifest       `json:"manifest"`
@@ -72,7 +75,13 @@ const (
 	KindWrite       = "write_error"
 	KindInterrupted = "interrupted"
 	KindPartial     = "partial_failure"
+	// KindLocked: the workspace is occupied by another run and the caller
+	// asked not to queue (Options.NoWait).
+	KindLocked = "locked"
 )
+
+// errLocked signals that the workspace lock is held by another process.
+var errLocked = errors.New("workspace is locked by another run")
 
 // ClassifiedErr carries a machine-readable error category.
 type ClassifiedErr struct {
@@ -103,6 +112,9 @@ type Options struct {
 	Workers int
 	// ManifestName is the manifest file name under .scaffold/.
 	ManifestName string
+	// NoWait makes Run fail fast with KindLocked when another process holds
+	// the workspace lock, instead of queueing until the lock is free.
+	NoWait bool
 }
 
 // Engine runs plans against a root directory.
@@ -127,10 +139,31 @@ func New(root string, opts Options) *Engine {
 }
 
 // Run validates and executes the plan. On failure or ctx cancellation it
-// rolls back every file created during this run and leaves the previous
+// restores the workspace byte-for-byte to its pre-run state (removing files
+// it created and restoring files it overwrote) and leaves the previous
 // manifest untouched, then returns a classified error and a best-effort
-// report. A successful run always commits the new manifest atomically.
+// report. A successful run commits the new manifest and the run journal
+// atomically.
 func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
+	return e.execute(ctx, p, false)
+}
+
+// DryRun validates and simulates the plan exactly like Run but never writes:
+// no files are created or modified, no manifest or journal is committed, and
+// the .scaffold directory is not even created. Every per-target conclusion
+// (created / verified / recreated / modified / preexisting / skipped /
+// failed) is produced by the same code path a real run uses, so a dry run
+// matches a real run target-for-target as long as the workspace does not
+// change in between and no write-level I/O error occurs (a dry run cannot
+// foresee disk-full or permission failures).
+func (e *Engine) DryRun(ctx context.Context, p *plan.Plan) (*Report, error) {
+	return e.execute(ctx, p, true)
+}
+
+// execute is the shared implementation of Run and DryRun. In dry mode it
+// performs no writes of any kind: no workspace lock, no journal, no file
+// writes, no manifest commit, and attempt counters are left untouched.
+func (e *Engine) execute(ctx context.Context, p *plan.Plan, dry bool) (*Report, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -141,6 +174,7 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 	}
 	report := &Report{
 		PlanName: p.NameSafe(),
+		DryRun:   dry,
 		Order:    orderIDs,
 		Results:  []Result{},
 		Manifest: newEmptyManifest(),
@@ -155,6 +189,41 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 	}
 
 	manifestDir := filepath.Join(e.root, ManifestDir)
+
+	// Real runs serialize across processes and journal their progress so the
+	// state stays queryable afterwards, whatever the outcome.
+	var journal *RunState
+	if !dry {
+		lock, lerr := acquireLock(ctx, manifestDir, e.options.NoWait)
+		if lerr != nil {
+			kind := KindManifest
+			msg := lerr.Error()
+			switch {
+			case errors.Is(lerr, errLocked):
+				kind = KindLocked
+				msg = "workspace is locked by another run; queue (default), retry later, or inspect with the status command"
+			case ctx.Err() != nil:
+				kind = KindInterrupted
+				msg = "interrupted while waiting for the workspace lock: " + lerr.Error()
+			}
+			report.Error = &ClassifiedErr{Kind: kind, Message: msg}
+			return report, report.Error
+		}
+		defer lock.release()
+
+		journal = &RunState{
+			Version:   journalVersion,
+			RunID:     newRunID(),
+			PlanName:  p.NameSafe(),
+			Phase:     PhaseRunning,
+			StartedAt: nowUTC(),
+		}
+		if err := saveJournal(manifestDir, journal); err != nil {
+			report.Error = &ClassifiedErr{Kind: KindManifest, Message: "record run start: " + err.Error()}
+			return report, report.Error
+		}
+	}
+
 	manifest, err := loadManifest(manifestDir, e.options.ManifestName)
 	if err != nil {
 		report.Error = &ClassifiedErr{Kind: KindManifest, Message: err.Error()}
@@ -165,7 +234,8 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 	var stateMu sync.Mutex
 	rendered := make(map[string]string, len(order)) // target ID -> body
 	staged := Manifest{Version: manifestVersion, Entries: map[string]FileEntry{}}
-	var createdPaths []string // paths created this run (rollback set)
+	var createdPaths []string          // paths created this run (rollback: delete)
+	overwritten := map[string]string{} // paths rewritten this run -> pre-run content (rollback: restore)
 	var interrupted bool
 	var firstErr *ClassifiedErr
 
@@ -182,7 +252,11 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 	jobResults := sched.run(ctx, func(ctx context.Context, t *plan.Target) outcome {
 		// An attempt starts as soon as the target is actually processed, so
 		// the counter survives in the Engine even when a run rolls back.
-		attempt := e.bumpAttempt(t.ID)
+		// Dry runs are pure observation and do not consume attempts.
+		attempt := 0
+		if !dry {
+			attempt = e.bumpAttempt(t.ID)
+		}
 		if err := ctx.Err(); err != nil {
 			markFailure(KindInterrupted, "run interrupted before processing target "+t.ID+": "+err.Error())
 			stateMu.Lock()
@@ -217,7 +291,12 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 			markFailure(KindWrite, werr.Error())
 			return outcome{status: StatusFailed, reason: werr.Error(), attempt: attempt, sha: sum}
 		}
-		if apply {
+		if apply && !dry {
+			if status == StatusRecreated {
+				// Record the pre-run content before touching the file so a
+				// failed run can restore it byte-for-byte.
+				overwritten[t.Path] = manifest.Entries[t.Path].Content
+			}
 			if err := e.writeFile(t.Path, body); err != nil {
 				markFailure(KindWrite, err.Error())
 				return outcome{status: StatusFailed, reason: err.Error(), attempt: attempt, sha: sum}
@@ -256,32 +335,64 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 	}
 	report.Results = results
 
-	if failed || interrupted || firstErr != nil {
-		// All-or-nothing: remove exactly the files this run created and leave
-		// everything else byte-for-byte untouched. Best-effort cleanup; every
-		// removal error is reported so the state stays diagnosable.
+	// rollback restores the workspace to its pre-run state: files this run
+	// overwrote get their recorded pre-run content back, files this run
+	// created are deleted. Best-effort; every error is reported so the state
+	// stays diagnosable. No-op in dry mode (nothing was written).
+	rollback := func() []string {
 		var cleanupMsgs []string
 		stateMu.Lock()
 		toRemove := append([]string(nil), createdPaths...)
+		toRestore := make(map[string]string, len(overwritten))
+		for path, content := range overwritten {
+			toRestore[path] = content
+		}
 		stateMu.Unlock()
+		// Restore first, then delete: either order converges, but restoring
+		// first keeps managed files continuously present.
+		for _, rel := range sortedKeys(toRestore) {
+			if wErr := e.writeFile(rel, toRestore[rel]); wErr != nil {
+				cleanupMsgs = append(cleanupMsgs, wErr.Error())
+			}
+		}
 		for _, rel := range toRemove {
 			if rmErr := os.Remove(filepath.Join(e.root, rel)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 				cleanupMsgs = append(cleanupMsgs, rmErr.Error())
 			}
 		}
+		return cleanupMsgs
+	}
+
+	if failed || interrupted || firstErr != nil {
 		kind := KindPartial
-		msg := "one or more targets failed; created files were rolled back and the manifest was not updated"
+		msg := "one or more targets failed; the workspace was restored to its pre-run state and the manifest was not updated"
 		if interrupted {
 			kind = KindInterrupted
-			msg = "run was interrupted; created files were rolled back and the manifest was not updated"
+			msg = "run was interrupted; the workspace was restored to its pre-run state and the manifest was not updated"
 		}
 		if firstErr != nil && firstErr.Kind == KindRender {
 			kind = KindRender
 		}
-		if len(cleanupMsgs) > 0 {
-			msg += "; cleanup errors: " + strings.Join(cleanupMsgs, "; ")
+		if dry {
+			msg = "one or more targets would fail; no files were touched (dry run)"
+			if interrupted {
+				msg = "dry run was interrupted; no files were touched"
+			}
+			report.Error = &ClassifiedErr{Kind: kind, Message: msg, Results: results}
+			return report, report.Error
+		}
+		if cleanupMsgs := rollback(); len(cleanupMsgs) > 0 {
+			msg += "; cleanup errors (manual inspection required): " + strings.Join(cleanupMsgs, "; ")
 		}
 		report.Error = &ClassifiedErr{Kind: kind, Message: msg, Results: results}
+		journal.Phase = PhaseRolledBack
+		journal.FinishedAt = nowUTC()
+		journal.Success = false
+		journal.Error = report.Error
+		journal.Results = results
+		if jErr := saveJournal(manifestDir, journal); jErr != nil {
+			report.Error.Message += "; additionally, recording the run state failed: " + jErr.Error()
+		}
 		return report, report.Error
 	}
 
@@ -303,8 +414,36 @@ func (e *Engine) Run(ctx context.Context, p *plan.Plan) (*Report, error) {
 	for path, entry := range staged.Entries {
 		merged.Entries[path] = entry
 	}
+	if dry {
+		// The manifest in the report is what a real run would commit.
+		report.Success = true
+		report.Manifest = merged
+		return report, nil
+	}
 	if err := saveManifest(manifestDir, e.options.ManifestName, merged); err != nil {
-		report.Error = &ClassifiedErr{Kind: KindManifest, Message: "commit failed after writing files: " + err.Error() + "; files are left on disk and match the rendered content", Results: results}
+		// Commit failed: the run did not succeed, so the all-or-nothing
+		// guarantee applies — roll the workspace back to its pre-run state.
+		msg := "commit failed: " + err.Error() + "; the workspace was restored to its pre-run state"
+		if cleanupMsgs := rollback(); len(cleanupMsgs) > 0 {
+			msg += "; cleanup errors (manual inspection required): " + strings.Join(cleanupMsgs, "; ")
+		}
+		report.Error = &ClassifiedErr{Kind: KindManifest, Message: msg, Results: results}
+		journal.Phase = PhaseRolledBack
+		journal.FinishedAt = nowUTC()
+		journal.Success = false
+		journal.Error = report.Error
+		journal.Results = results
+		if jErr := saveJournal(manifestDir, journal); jErr != nil {
+			report.Error.Message += "; additionally, recording the run state failed: " + jErr.Error()
+		}
+		return report, report.Error
+	}
+	journal.Phase = PhaseCommitted
+	journal.FinishedAt = nowUTC()
+	journal.Success = true
+	journal.Results = results
+	if jErr := saveJournal(manifestDir, journal); jErr != nil {
+		report.Error = &ClassifiedErr{Kind: KindManifest, Message: "run committed but recording the run state failed: " + jErr.Error(), Results: results}
 		return report, report.Error
 	}
 	report.Success = true
@@ -375,4 +514,24 @@ func (e *Engine) bumpAttempt(id string) int {
 	defer e.attemptMu.Unlock()
 	e.attempt[id]++
 	return e.attempt[id]
+}
+
+// nowUTC returns the current UTC timestamp in journal format.
+func nowUTC() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
+// newRunID builds a unique-enough run identifier from time and PID.
+func newRunID() string {
+	return fmt.Sprintf("%s-%d", time.Now().UTC().Format("20060102T150405.000000000"), os.Getpid())
+}
+
+// sortedKeys returns the keys of m in deterministic order.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

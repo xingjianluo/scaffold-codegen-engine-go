@@ -52,6 +52,8 @@ func exitForKind(kind string) int {
 		return 5
 	case engine.KindPartial:
 		return 6
+	case engine.KindLocked:
+		return 7
 	default:
 		return 10
 	}
@@ -69,6 +71,10 @@ func run(args []string) error {
 		return cmdValidate(args[1:])
 	case "run":
 		return cmdRun(args[1:])
+	case "dry-run":
+		return cmdDryRun(args[1:])
+	case "status":
+		return cmdStatus(args[1:])
 	case "-h", "--help", "help":
 		usage()
 		return nil
@@ -84,10 +90,13 @@ func usage() {
 Commands:
   plan-example [-o path]   write an example plan JSON to path (default stdout)
   validate   -f plan.json  validate a plan and print classified issues
-  run        -f plan.json -root DIR [-workers N]  execute a plan
+  dry-run    -f plan.json -root DIR [-workers N]  simulate a run, write nothing
+  status     -f plan.json -root DIR  show last run state and workspace drift
+  run        -f plan.json -root DIR [-workers N] [-no-wait]  execute a plan
 
 Exit codes: 0 ok, 2 invalid plan, 3 render error, 4 write/manifest error,
-5 interrupted, 6 partial failure, 10 other error.
+5 interrupted, 6 partial failure, 7 workspace locked (with -no-wait),
+10 other error.
 `)
 }
 
@@ -136,6 +145,7 @@ func cmdRun(args []string) error {
 	file := fs.String("f", "plan.json", "plan file")
 	root := fs.String("root", "out", "output root directory")
 	workers := fs.Int("workers", 4, "max parallel workers")
+	noWait := fs.Bool("no-wait", false, "fail with 'locked' instead of queueing when the workspace is busy")
 	quiet := fs.Bool("quiet", false, "suppress the JSON report")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -148,10 +158,53 @@ func cmdRun(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	e := engine.New(*root, engine.Options{Workers: *workers})
+	e := engine.New(*root, engine.Options{Workers: *workers, NoWait: *noWait})
 	report, err := e.Run(ctx, p)
 	if report != nil && !*quiet {
 		_ = writeReport(os.Stdout, report)
+	}
+	return err
+}
+
+func cmdDryRun(args []string) error {
+	fs := flag.NewFlagSet("dry-run", flag.ContinueOnError)
+	file := fs.String("f", "plan.json", "plan file")
+	root := fs.String("root", "out", "output root directory")
+	workers := fs.Int("workers", 4, "max parallel workers")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	p, err := loadPlan(*file)
+	if err != nil {
+		return err
+	}
+
+	e := engine.New(*root, engine.Options{Workers: *workers})
+	report, err := e.DryRun(context.Background(), p)
+	if report != nil {
+		_ = writeReport(os.Stdout, report)
+	}
+	return err
+}
+
+func cmdStatus(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	file := fs.String("f", "plan.json", "plan file")
+	root := fs.String("root", "out", "output root directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	p, err := loadPlan(*file)
+	if err != nil {
+		return err
+	}
+
+	e := engine.New(*root, engine.Options{})
+	report, err := e.Inspect(context.Background(), p)
+	if report != nil {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(report)
 	}
 	return err
 }

@@ -32,7 +32,9 @@ func Validate(p *Plan) Issues {
 			issues = append(issues, Issue{Code: IssueEmptyID, Target: id, Message: "target is null"})
 			continue
 		}
-		t.ID = id // the map key is authoritative
+		// The map key is the authoritative ID; Validate never mutates the
+		// plan, so concurrent runs over a shared *Plan are race-free.
+		// ExecutionOrder hands out per-call copies carrying the ID.
 
 		if strings.TrimSpace(id) == "" {
 			issues = append(issues, Issue{Code: IssueEmptyID, Message: "target id must not be empty"})
@@ -205,7 +207,12 @@ func ExecutionOrder(p *Plan) ([]*Target, Issues) {
 	for len(ready) > 0 {
 		id := ready[0]
 		ready = ready[1:]
-		order = append(order, p.Targets[id])
+		// Hand out a copy carrying the authoritative ID instead of
+		// mutating the caller's plan: callers may share one *Plan across
+		// concurrent runs.
+		cp := *p.Targets[id]
+		cp.ID = id
+		order = append(order, &cp)
 
 		next := append([]string(nil), children[id]...)
 		sort.Strings(next)
